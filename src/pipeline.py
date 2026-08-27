@@ -1,8 +1,8 @@
 from pathlib import Path
 import hashlib
-import json
 import re
 import zipfile
+
 import numpy as np
 
 try:
@@ -11,664 +11,1288 @@ except Exception:
     joblib = None
 
 try:
-    from androguard.misc import AnalyzeAPK
-except Exception:
-    AnalyzeAPK = None
-
-try:
     from androguard.core.apk import APK
 except Exception:
     APK = None
 
-
-SENSITIVE = {
-    "android.permission.CAMERA": 10,
-    "android.permission.RECORD_AUDIO": 10,
-    "android.permission.RECORD_VIDEO": 8,
-    "android.permission.READ_SMS": 9,
-    "android.permission.SEND_SMS": 8,
-    "android.permission.RECEIVE_SMS": 8,
-    "android.permission.READ_CALL_LOG": 8,
-    "android.permission.READ_CONTACTS": 7,
-    "android.permission.ACCESS_FINE_LOCATION": 8,
-    "android.permission.ACCESS_COARSE_LOCATION": 5,
-    "android.permission.BIND_ACCESSIBILITY_SERVICE": 12,
-    "android.permission.RECEIVE_BOOT_COMPLETED": 8,
-    "android.permission.INTERNET": 4,
-    "android.permission.READ_PHONE_STATE": 5,
-}
+try:
+    from androguard.core.dex import DEX
+except Exception:
+    DEX = None
 
 
-# 25 configurable Dalvik opcode categories
-OPCODES = [
-    "move", "return", "const", "invoke", "new", "goto", "if", "cmp",
-    "array", "field", "monitor", "throw", "check", "instance", "switch",
-    "add", "sub", "mul", "div", "rem", "and", "or", "xor", "shl", "shr"
+# ============================================================
+# FIXED 75 ANDROID STATIC FEATURES
+# 20 permissions
+# 15 manifest/component
+# 25 opcode 2-grams
+# 10 suspicious API/code indicators
+# 5 APK/file indicators
+# ============================================================
+
+PERMISSIONS = [
+    "android.permission.CAMERA",
+    "android.permission.RECORD_AUDIO",
+    "android.permission.RECORD_VIDEO",
+    "android.permission.READ_SMS",
+    "android.permission.SEND_SMS",
+    "android.permission.RECEIVE_SMS",
+    "android.permission.READ_CALL_LOG",
+    "android.permission.WRITE_CALL_LOG",
+    "android.permission.READ_CONTACTS",
+    "android.permission.WRITE_CONTACTS",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.BIND_ACCESSIBILITY_SERVICE",
+    "android.permission.RECEIVE_BOOT_COMPLETED",
+    "android.permission.INTERNET",
+    "android.permission.READ_PHONE_STATE",
+    "android.permission.READ_EXTERNAL_STORAGE",
+    "android.permission.WRITE_EXTERNAL_STORAGE",
+    "android.permission.REQUEST_INSTALL_PACKAGES",
+    "android.permission.SYSTEM_ALERT_WINDOW",
 ]
 
+# 5 categories × 5 categories = 25 fixed opcode 2-grams
+OPCODE_CATEGORIES = [
+    "move",
+    "const",
+    "invoke",
+    "control",
+    "data",
+]
 
-def _safe_call(obj, method_name, default=None):
-    """Safely call an androguard method."""
+OPCODE_FEATURES = [
+    f"op2::{a}_{b}"
+    for a in OPCODE_CATEGORIES
+    for b in OPCODE_CATEGORIES
+]
+
+MANIFEST_FEATURES = [
+    "num_activities",
+    "num_services",
+    "num_receivers",
+    "num_providers",
+    "num_custom_permissions",
+    "num_components",
+    "num_permissions",
+    "min_sdk",
+    "target_sdk",
+    "sdk_gap",
+    "num_exported_components",
+    "num_intent_filters",
+    "is_debuggable",
+    "allow_backup",
+    "uses_cleartext_traffic",
+]
+
+API_PATTERNS = {
+    "api_sms": [
+        "smsmanager",
+        "sendtextmessage",
+        "sendsmsto",
+    ],
+    "api_telephony": [
+        "telephonymanager",
+        "getdeviceid",
+        "getsubscriberid",
+        "simoperator",
+    ],
+    "api_location": [
+        "locationmanager",
+        "fusedlocation",
+        "getlastknownlocation",
+        "requestlocationupdates",
+    ],
+    "api_camera": [
+        "android.hardware.camera",
+        "cameramanager",
+        "camera2",
+    ],
+    "api_audio": [
+        "mediarecorder",
+        "audiorecord",
+        "microphone",
+    ],
+    "api_accessibility": [
+        "accessibilityservice",
+        "accessibilityevent",
+        "accessibilitynodeinfo",
+    ],
+    "api_dynamic_loading": [
+        "dexclassloader",
+        "pathclassloader",
+        "inmemorydexclassloader",
+    ],
+    "api_reflection": [
+        "java.lang.reflect",
+        "method.invoke",
+        "class.forname",
+        "getdeclaredmethod",
+    ],
+    "api_process_exec": [
+        "runtime.exec",
+        "processbuilder",
+        "exec(",
+        "su",
+    ],
+    "api_crypto_encoding": [
+        "javax.crypto",
+        "cipher.getinstance",
+        "base64",
+        "messagedigest",
+    ],
+}
+
+API_FEATURES = list(API_PATTERNS.keys())
+
+APK_FEATURES = [
+    "num_dex_files",
+    "num_dex_instructions",
+    "has_native_libs",
+    "num_executable_archives",
+    "apk_size_mb",
+]
+
+FEATURE_NAMES = (
+    [f"perm::{p}" for p in PERMISSIONS]
+    + MANIFEST_FEATURES
+    + OPCODE_FEATURES
+    + API_FEATURES
+    + APK_FEATURES
+)
+
+assert len(FEATURE_NAMES) == 75
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _safe_call(obj, name, default=None):
     try:
-        method = getattr(obj, method_name, None)
-        if callable(method):
-            value = method()
-            return value if value is not None else default
+        fn = getattr(obj, name, None)
+
+        if callable(fn):
+            value = fn()
+
+            if value is None:
+                return default
+
+            return value
+
     except Exception:
         pass
+
     return default
 
 
-def _normalise_dex(dex):
-    """Convert androguard DEX output to a list."""
-    if dex is None:
-        return []
-
-    if isinstance(dex, (list, tuple)):
-        return list(dex)
-
-    return [dex]
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
-def _opcode_features(dex_objects):
-    """
-    Extract simplified opcode 2-gram features.
+def _text(value):
+    if value is None:
+        return ""
 
-    Invalid/corrupted DEX files are skipped instead of crashing
-    the complete application.
-    """
-    counts = {
-        f"{a}_{b}": 0
-        for a in OPCODES
-        for b in OPCODES
+    try:
+        return str(value).lower()
+    except Exception:
+        return ""
+
+
+# ============================================================
+# APK ZIP INFORMATION
+# ============================================================
+
+def _apk_zip_info(apk_path):
+
+    result = {
+        "is_zip": False,
+        "has_manifest": False,
+        "has_dex": False,
+        "dex_files": [],
+        "native_libs": 0,
+        "executable_archives": 0,
+        "file_count": 0,
     }
 
-    total = 0
+    try:
 
-    for d in dex_objects:
+        with zipfile.ZipFile(apk_path, "r") as z:
+
+            names = z.namelist()
+
+            result["is_zip"] = True
+
+            result["has_manifest"] = (
+                "AndroidManifest.xml" in names
+            )
+
+            result["dex_files"] = [
+                name
+                for name in names
+                if re.fullmatch(
+                    r"classes(?:\d+)?\.dex",
+                    Path(name).name
+                )
+            ]
+
+            result["has_dex"] = bool(
+                result["dex_files"]
+            )
+
+            result["native_libs"] = sum(
+                1
+                for name in names
+                if name.startswith("lib/")
+                and name.endswith(".so")
+            )
+
+            result["executable_archives"] = sum(
+                1
+                for name in names
+                if name.lower().endswith(
+                    (
+                        ".jar",
+                        ".zip",
+                        ".bin",
+                        ".dat",
+                    )
+                )
+            )
+
+            result["file_count"] = len(names)
+
+    except Exception:
+        pass
+
+    return result
+
+
+# ============================================================
+# OPCODE CATEGORY
+# ============================================================
+
+def _opcode_category(opcode):
+
+    op = _text(opcode)
+
+    if op.startswith("move"):
+        return "move"
+
+    if op.startswith("const"):
+        return "const"
+
+    if op.startswith("invoke"):
+        return "invoke"
+
+    control_prefixes = (
+        "goto",
+        "if-",
+        "if",
+        "switch",
+        "return",
+        "throw",
+        "cmp",
+    )
+
+    if op.startswith(control_prefixes):
+        return "control"
+
+    return "data"
+
+
+# ============================================================
+# OPCODE FEATURES
+# ============================================================
+
+def _opcode_features(dex_objects):
+
+    counts = {
+        name: 0
+        for name in OPCODE_FEATURES
+    }
+
+    total_instructions = 0
+
+    for dex in dex_objects:
+
         try:
-            classes = d.get_classes()
 
-            for c in classes:
+            for cls in dex.get_classes():
+
                 try:
-                    methods = c.get_methods()
+                    methods = cls.get_methods()
                 except Exception:
                     continue
 
-                for m in methods:
+                for method in methods:
+
                     try:
-                        code = m.get_code()
+
+                        code = method.get_code()
 
                         if not code:
                             continue
 
-                        instructions = list(
-                            code.get_bc().get_instructions()
+                        instructions = (
+                            code.get_bc()
+                            .get_instructions()
                         )
 
-                        prev = None
+                        previous = None
 
-                        for insn in instructions:
+                        for instruction in instructions:
+
                             try:
-                                op = insn.get_name().lower()
+                                opcode = instruction.get_name()
                             except Exception:
                                 continue
 
-                            cat = next(
-                                (
-                                    x for x in OPCODES
-                                    if op.startswith(x)
-                                ),
-                                "other"
+                            current = _opcode_category(
+                                opcode
                             )
 
-                            if prev is not None:
-                                key = f"{prev}_{cat}"
+                            if previous is not None:
 
-                                if key in counts:
-                                    counts[key] += 1
+                                key = (
+                                    f"op2::{previous}_{current}"
+                                )
 
-                            prev = cat
-                            total += 1
+                                counts[key] += 1
+
+                            previous = current
+
+                            total_instructions += 1
 
                     except Exception:
-                        # Skip problematic methods
                         continue
 
         except Exception:
-            # Skip problematic DEX objects
             continue
 
-    top = sorted(
-        counts.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )[:25]
-
-    return dict(top), total
+    return counts, total_instructions
 
 
-def _basic_zip_check(apk_path):
-    """Check whether the uploaded file is a readable ZIP/APK."""
-    try:
-        with zipfile.ZipFile(apk_path, "r") as z:
-            names = z.namelist()
+# ============================================================
+# DEX TEXT FOR API INDICATORS
+# ============================================================
 
-            return {
-                "is_zip": True,
-                "has_manifest": "AndroidManifest.xml" in names,
-                "has_dex": any(
-                    name.startswith("classes")
-                    and name.endswith(".dex")
-                    for name in names
-                ),
-                "file_count": len(names),
-            }
+def _dex_text(dex_objects):
 
-    except Exception:
-        return {
-            "is_zip": False,
-            "has_manifest": False,
-            "has_dex": False,
-            "file_count": 0,
-        }
+    chunks = []
 
+    # Limit keeps very large APKs manageable.
+    MAX_ITEMS = 150000
 
-def _extract_manifest_only(apk_path):
-    """
-    Fallback analysis.
-
-    If AnalyzeAPK fails because of a bad DEX checksum,
-    try to read only the APK/manifest information.
-    """
-
-    if APK is None:
-        return None
-
-    try:
-        a = APK(apk_path)
-
-        perms = _safe_call(
-            a,
-            "get_permissions",
-            []
-        ) or []
-
-        activities = _safe_call(
-            a,
-            "get_activities",
-            []
-        ) or []
-
-        services = _safe_call(
-            a,
-            "get_services",
-            []
-        ) or []
-
-        receivers = _safe_call(
-            a,
-            "get_receivers",
-            []
-        ) or []
-
-        providers = _safe_call(
-            a,
-            "get_providers",
-            []
-        ) or []
-
-        custom = []
+    for dex in dex_objects:
 
         try:
-            custom = a.get_declared_permissions() or []
+
+            for cls in dex.get_classes():
+
+                try:
+                    methods = cls.get_methods()
+                except Exception:
+                    continue
+
+                for method in methods:
+
+                    try:
+
+                        code = method.get_code()
+
+                        if not code:
+                            continue
+
+                        for instruction in (
+                            code.get_bc()
+                            .get_instructions()
+                        ):
+
+                            try:
+                                chunks.append(
+                                    instruction.get_name()
+                                )
+                            except Exception:
+                                pass
+
+                            try:
+                                chunks.append(
+                                    instruction.get_output()
+                                )
+                            except Exception:
+                                pass
+
+                            if len(chunks) >= MAX_ITEMS:
+                                return " ".join(
+                                    chunks
+                                ).lower()
+
+                    except Exception:
+                        continue
+
         except Exception:
-            pass
+            continue
 
-        return {
-            "package": _safe_call(a, "get_package", "Unknown"),
-            "version_name": _safe_call(
-                a,
-                "get_androidversion_name",
-                "Unknown"
-            ),
-            "min_sdk": _safe_call(
-                a,
-                "get_min_sdk_version",
-                "Unknown"
-            ),
-            "target_sdk": _safe_call(
-                a,
-                "get_target_sdk_version",
-                "Unknown"
-            ),
-            "permissions": perms,
-            "activities": activities,
-            "services": services,
-            "receivers": receivers,
-            "providers": providers,
-            "custom_permissions": custom,
-        }
-
-    except Exception:
-        return None
+    return " ".join(chunks).lower()
 
 
-def _build_evidence(
-    apk_path,
-    manifest_data,
-    dex_count=0,
-    opcode_instructions=0,
-    analysis_mode="full"
-):
-    """Create a common evidence structure."""
+# ============================================================
+# API INDICATORS
+# ============================================================
 
-    file_hash = hashlib.sha256(
-        Path(apk_path).read_bytes()
-    ).hexdigest()
+def _api_indicators(dex_text):
 
-    zip_info = _basic_zip_check(apk_path)
+    result = {}
 
-    return {
-        "package": manifest_data.get("package", "Unknown"),
-        "version_name": manifest_data.get(
-            "version_name",
-            "Unknown"
-        ),
-        "min_sdk": manifest_data.get(
-            "min_sdk",
-            "Unknown"
-        ),
-        "target_sdk": manifest_data.get(
-            "target_sdk",
-            "Unknown"
-        ),
-        "sha256": file_hash,
-        "permissions": manifest_data.get(
-            "permissions",
-            []
-        ),
-        "activities": manifest_data.get(
-            "activities",
-            []
-        ),
-        "services": manifest_data.get(
-            "services",
-            []
-        ),
-        "receivers": manifest_data.get(
-            "receivers",
-            []
-        ),
-        "providers": manifest_data.get(
-            "providers",
-            []
-        ),
-        "custom_permissions": manifest_data.get(
-            "custom_permissions",
-            []
-        ),
-        "dex_files": dex_count,
-        "opcode_instructions": opcode_instructions,
-        "analysis_mode": analysis_mode,
-        "zip_valid": zip_info["is_zip"],
-        "has_manifest": zip_info["has_manifest"],
-        "has_dex": zip_info["has_dex"],
-        "apk_file_count": zip_info["file_count"],
-    }
+    for feature, patterns in API_PATTERNS.items():
 
-
-def extract_features(apk_path):
-    """
-    Main feature extraction.
-
-    First attempts complete Manifest + DEX analysis.
-
-    If DEX parsing fails, especially because of:
-        Wrong Adler32 checksum for DEX file
-
-    the application falls back to Manifest-only analysis
-    instead of crashing.
-    """
-
-    if AnalyzeAPK is None and APK is None:
-        raise RuntimeError(
-            "Androguard is not installed. "
-            "Run: pip install -r requirements.txt"
+        result[feature] = int(
+            any(
+                pattern.lower() in dex_text
+                for pattern in patterns
+            )
         )
 
-    # ---------------------------------------------------------
-    # STEP 1: Try complete Manifest + DEX analysis
-    # ---------------------------------------------------------
+    return result
 
-    if AnalyzeAPK is not None:
 
-        try:
-            a, dex, dx = AnalyzeAPK(apk_path)
+# ============================================================
+# MANIFEST ATTRIBUTES
+# ============================================================
 
-            perms = _safe_call(
-                a,
-                "get_permissions",
-                []
-            ) or []
+def _manifest_stats(apk):
 
-            acts = _safe_call(
-                a,
-                "get_activities",
-                []
-            ) or []
+    result = {
+        "num_exported_components": 0,
+        "num_intent_filters": 0,
+        "is_debuggable": 0,
+        "allow_backup": 0,
+        "uses_cleartext_traffic": 0,
+    }
 
-            svcs = _safe_call(
-                a,
-                "get_services",
-                []
-            ) or []
+    try:
 
-            recs = _safe_call(
-                a,
-                "get_receivers",
-                []
-            ) or []
+        xml = apk.get_android_manifest_xml()
 
-            provs = _safe_call(
-                a,
-                "get_providers",
-                []
-            ) or []
+        if xml is None:
+            return result
 
-            custom = []
+        root = (
+            xml.getroot()
+            if hasattr(xml, "getroot")
+            else xml
+        )
+
+        namespace = (
+            "{http://schemas.android.com/apk/res/android}"
+        )
+
+        def get_attr(element, name):
 
             try:
-                custom = a.get_declared_permissions() or []
+                return element.get(
+                    namespace + name
+                )
             except Exception:
-                pass
+                return None
 
-            dex_objects = _normalise_dex(dex)
+        applications = list(
+            root.iter("application")
+        )
 
-            op_counts, total_ops = _opcode_features(
-                dex_objects
+        if applications:
+
+            application = applications[0]
+
+            result["is_debuggable"] = int(
+                _text(
+                    get_attr(
+                        application,
+                        "debuggable"
+                    )
+                ) == "true"
             )
 
-            manifest_data = {
-                "package": _safe_call(
-                    a,
-                    "get_package",
-                    "Unknown"
-                ),
-                "version_name": _safe_call(
-                    a,
-                    "get_androidversion_name",
-                    "Unknown"
-                ),
-                "min_sdk": _safe_call(
-                    a,
-                    "get_min_sdk_version",
-                    "Unknown"
-                ),
-                "target_sdk": _safe_call(
-                    a,
-                    "get_target_sdk_version",
-                    "Unknown"
-                ),
-                "permissions": perms,
-                "activities": acts,
-                "services": svcs,
-                "receivers": recs,
-                "providers": provs,
-                "custom_permissions": custom,
-            }
-
-            evidence = _build_evidence(
-                apk_path,
-                manifest_data,
-                dex_count=len(dex_objects),
-                opcode_instructions=total_ops,
-                analysis_mode="full"
+            result["allow_backup"] = int(
+                _text(
+                    get_attr(
+                        application,
+                        "allowBackup"
+                    )
+                ) == "true"
             )
 
-            return evidence, op_counts
-
-        except Exception as dex_error:
-
-            error_text = str(dex_error)
-
-            # -------------------------------------------------
-            # STEP 2: DEX failed -> Manifest-only fallback
-            # -------------------------------------------------
-
-            manifest_data = _extract_manifest_only(
-                apk_path
+            result["uses_cleartext_traffic"] = int(
+                _text(
+                    get_attr(
+                        application,
+                        "usesCleartextTraffic"
+                    )
+                ) == "true"
             )
 
-            if manifest_data is not None:
+        exported = 0
+        intent_filters = 0
 
-                evidence = _build_evidence(
-                    apk_path,
-                    manifest_data,
-                    dex_count=0,
-                    opcode_instructions=0,
-                    analysis_mode="manifest_only"
+        for tag in [
+            "activity",
+            "activity-alias",
+            "service",
+            "receiver",
+            "provider",
+        ]:
+
+            for node in root.iter(tag):
+
+                if (
+                    _text(
+                        get_attr(
+                            node,
+                            "exported"
+                        )
+                    )
+                    == "true"
+                ):
+                    exported += 1
+
+                intent_filters += sum(
+                    1
+                    for child in list(node)
+                    if getattr(
+                        child,
+                        "tag",
+                        ""
+                    ) == "intent-filter"
                 )
 
-                evidence["dex_error"] = error_text
+        result["num_exported_components"] = exported
 
-                return evidence, {}
+        result["num_intent_filters"] = (
+            intent_filters
+        )
 
-            # -------------------------------------------------
-            # STEP 3: APK itself is unreadable
-            # -------------------------------------------------
+    except Exception:
+        pass
 
-            zip_info = _basic_zip_check(apk_path)
+    return result
 
-            if not zip_info["is_zip"]:
-                raise RuntimeError(
-                    "The uploaded file is not a valid APK/ZIP "
-                    "or is corrupted."
-                )
 
-            raise RuntimeError(
-                "APK manifest could not be read. "
-                f"DEX analysis error: {error_text}"
-            )
+# ============================================================
+# MAIN FEATURE EXTRACTION
+# ============================================================
 
-    # ---------------------------------------------------------
-    # AnalyzeAPK unavailable -> direct APK fallback
-    # ---------------------------------------------------------
+def extract_features(apk_path):
 
-    manifest_data = _extract_manifest_only(
+    if APK is None:
+
+        raise RuntimeError(
+            "Androguard is not installed. "
+            "Add androguard to requirements.txt."
+        )
+
+    apk_path = str(apk_path)
+
+    zip_info = _apk_zip_info(
         apk_path
     )
 
-    if manifest_data is not None:
+    if not zip_info["is_zip"]:
 
-        evidence = _build_evidence(
-            apk_path,
-            manifest_data,
-            dex_count=0,
-            opcode_instructions=0,
-            analysis_mode="manifest_only"
+        raise RuntimeError(
+            "The uploaded file is not a valid APK."
         )
 
-        return evidence, {}
+    try:
 
-    raise RuntimeError(
-        "Unable to analyze this APK."
+        apk = APK(apk_path)
+
+        permissions = list(
+            _safe_call(
+                apk,
+                "get_permissions",
+                []
+            )
+            or []
+        )
+
+        activities = list(
+            _safe_call(
+                apk,
+                "get_activities",
+                []
+            )
+            or []
+        )
+
+        services = list(
+            _safe_call(
+                apk,
+                "get_services",
+                []
+            )
+            or []
+        )
+
+        receivers = list(
+            _safe_call(
+                apk,
+                "get_receivers",
+                []
+            )
+            or []
+        )
+
+        providers = list(
+            _safe_call(
+                apk,
+                "get_providers",
+                []
+            )
+            or []
+        )
+
+        custom_permissions = list(
+            _safe_call(
+                apk,
+                "get_declared_permissions",
+                []
+            )
+            or []
+        )
+
+        min_sdk = _safe_int(
+            _safe_call(
+                apk,
+                "get_min_sdk_version",
+                0
+            )
+        )
+
+        target_sdk = _safe_int(
+            _safe_call(
+                apk,
+                "get_target_sdk_version",
+                0
+            )
+        )
+
+        # ----------------------------------------------------
+        # Direct DEX loading.
+        # IMPORTANT: AnalyzeAPK() is NOT used.
+        # ----------------------------------------------------
+
+        dex_objects = []
+
+        try:
+
+            raw_dex = _safe_call(
+                apk,
+                "get_all_dex",
+                []
+            )
+
+            raw_dex = raw_dex or []
+
+            if not isinstance(
+                raw_dex,
+                (list, tuple)
+            ):
+                raw_dex = [raw_dex]
+
+            for item in raw_dex:
+
+                try:
+
+                    if hasattr(
+                        item,
+                        "get_classes"
+                    ):
+                        dex_objects.append(item)
+
+                    elif isinstance(
+                        item,
+                        (bytes, bytearray)
+                    ) and DEX is not None:
+
+                        dex_objects.append(
+                            DEX(bytes(item))
+                        )
+
+                except Exception:
+                    continue
+
+        except Exception:
+            dex_objects = []
+
+        # ----------------------------------------------------
+        # DEX features
+        # ----------------------------------------------------
+
+        opcode_counts, total_instructions = (
+            _opcode_features(
+                dex_objects
+            )
+        )
+
+        dex_text = _dex_text(
+            dex_objects
+        )
+
+        api_flags = _api_indicators(
+            dex_text
+        )
+
+        manifest_stats = _manifest_stats(
+            apk
+        )
+
+        component_count = (
+            len(activities)
+            + len(services)
+            + len(receivers)
+            + len(providers)
+        )
+
+        # ----------------------------------------------------
+        # Evidence
+        # ----------------------------------------------------
+
+        evidence = {
+
+            "package": _safe_call(
+                apk,
+                "get_package",
+                "Unknown"
+            ),
+
+            "version_name": _safe_call(
+                apk,
+                "get_androidversion_name",
+                "Unknown"
+            ),
+
+            "min_sdk": min_sdk,
+
+            "target_sdk": target_sdk,
+
+            "sha256": hashlib.sha256(
+                Path(
+                    apk_path
+                ).read_bytes()
+            ).hexdigest(),
+
+            "permissions": permissions,
+
+            "activities": activities,
+
+            "services": services,
+
+            "receivers": receivers,
+
+            "providers": providers,
+
+            "custom_permissions":
+                custom_permissions,
+
+            "dex_files":
+                len(
+                    zip_info["dex_files"]
+                ),
+
+            "opcode_instructions":
+                total_instructions,
+
+            "analysis_mode":
+                "static_75_features",
+
+            "zip_valid":
+                zip_info["is_zip"],
+
+            "has_manifest":
+                zip_info["has_manifest"],
+
+            "has_dex":
+                zip_info["has_dex"],
+
+            "apk_file_count":
+                zip_info["file_count"],
+
+            "native_lib_count":
+                zip_info["native_libs"],
+
+            "executable_archive_count":
+                zip_info[
+                    "executable_archives"
+                ],
+        }
+
+        # ====================================================
+        # BUILD EXACT 75 FEATURES
+        # ====================================================
+
+        vector = {}
+
+        # -------------------------------
+        # 20 PERMISSION FEATURES
+        # -------------------------------
+
+        for permission in PERMISSIONS:
+
+            vector[
+                f"perm::{permission}"
+            ] = int(
+                permission in permissions
+            )
+
+        # -------------------------------
+        # 15 MANIFEST FEATURES
+        # -------------------------------
+
+        vector.update({
+
+            "num_activities":
+                len(activities),
+
+            "num_services":
+                len(services),
+
+            "num_receivers":
+                len(receivers),
+
+            "num_providers":
+                len(providers),
+
+            "num_custom_permissions":
+                len(custom_permissions),
+
+            "num_components":
+                component_count,
+
+            "num_permissions":
+                len(permissions),
+
+            "min_sdk":
+                min_sdk,
+
+            "target_sdk":
+                target_sdk,
+
+            "sdk_gap":
+                max(
+                    0,
+                    target_sdk - min_sdk
+                ),
+
+            "num_exported_components":
+                manifest_stats[
+                    "num_exported_components"
+                ],
+
+            "num_intent_filters":
+                manifest_stats[
+                    "num_intent_filters"
+                ],
+
+            "is_debuggable":
+                manifest_stats[
+                    "is_debuggable"
+                ],
+
+            "allow_backup":
+                manifest_stats[
+                    "allow_backup"
+                ],
+
+            "uses_cleartext_traffic":
+                manifest_stats[
+                    "uses_cleartext_traffic"
+                ],
+        })
+
+        # -------------------------------
+        # 25 OPCODE FEATURES
+        # -------------------------------
+
+        vector.update(
+            opcode_counts
+        )
+
+        # -------------------------------
+        # 10 API FEATURES
+        # -------------------------------
+
+        vector.update(
+            api_flags
+        )
+
+        # -------------------------------
+        # 5 APK FEATURES
+        # -------------------------------
+
+        apk_size_mb = (
+            Path(apk_path).stat().st_size
+            / (1024 * 1024)
+        )
+
+        vector.update({
+
+            "num_dex_files":
+                len(
+                    zip_info["dex_files"]
+                ),
+
+            "num_dex_instructions":
+                total_instructions,
+
+            "has_native_libs":
+                int(
+                    zip_info["native_libs"]
+                    > 0
+                ),
+
+            "num_executable_archives":
+                zip_info[
+                    "executable_archives"
+                ],
+
+            "apk_size_mb":
+                round(
+                    apk_size_mb,
+                    4
+                ),
+        })
+
+        # ====================================================
+        # FORCE EXACT ORDER / EXACTLY 75 FEATURES
+        # ====================================================
+
+        vector = {
+            name: vector.get(
+                name,
+                0
+            )
+            for name in FEATURE_NAMES
+        }
+
+        assert len(vector) == 75
+
+        return (
+            evidence,
+            vector,
+            opcode_counts
+        )
+
+    except Exception as error:
+
+        raise RuntimeError(
+            f"Static APK extraction failed: {error}"
+        ) from error
+
+
+# ============================================================
+# EXPLAINABLE BACKUP RISK SCORE
+# NOT A TRAINED MODEL
+# ============================================================
+
+PERMISSION_WEIGHTS = {
+
+    "android.permission.CAMERA": 10,
+
+    "android.permission.RECORD_AUDIO": 10,
+
+    "android.permission.RECORD_VIDEO": 8,
+
+    "android.permission.READ_SMS": 9,
+
+    "android.permission.SEND_SMS": 8,
+
+    "android.permission.RECEIVE_SMS": 8,
+
+    "android.permission.READ_CALL_LOG": 8,
+
+    "android.permission.WRITE_CALL_LOG": 8,
+
+    "android.permission.READ_CONTACTS": 7,
+
+    "android.permission.WRITE_CONTACTS": 7,
+
+    "android.permission.ACCESS_FINE_LOCATION": 8,
+
+    "android.permission.ACCESS_COARSE_LOCATION": 5,
+
+    "android.permission.BIND_ACCESSIBILITY_SERVICE": 12,
+
+    "android.permission.RECEIVE_BOOT_COMPLETED": 8,
+
+    "android.permission.INTERNET": 4,
+
+    "android.permission.READ_PHONE_STATE": 5,
+
+    "android.permission.READ_EXTERNAL_STORAGE": 3,
+
+    "android.permission.WRITE_EXTERNAL_STORAGE": 4,
+
+    "android.permission.REQUEST_INSTALL_PACKAGES": 10,
+
+    "android.permission.SYSTEM_ALERT_WINDOW": 9,
+}
+
+
+def _calculate_scores(
+    evidence,
+    vector
+):
+
+    permissions = evidence.get(
+        "permissions",
+        []
     )
 
+    hits = [
+        (
+            permission,
+            PERMISSION_WEIGHTS[
+                permission
+            ]
+        )
+        for permission in permissions
+        if permission in PERMISSION_WEIGHTS
+    ]
+
+    permission_risk = min(
+        100,
+        sum(
+            weight
+            for _, weight in hits
+        ) * 3.5
+    )
+
+    component_risk = min(
+        100,
+        vector.get(
+            "num_components",
+            0
+        ) * 2.5
+        +
+        vector.get(
+            "num_exported_components",
+            0
+        ) * 3.5
+    )
+
+    api_risk = min(
+        100,
+        sum(
+            vector.get(
+                name,
+                0
+            )
+            for name in API_FEATURES
+        ) * 8
+    )
+
+    dex_risk = min(
+        100,
+        (
+            35
+            if vector.get(
+                "num_dex_files",
+                0
+            ) > 0
+            else 0
+        )
+        +
+        (
+            20
+            if vector.get(
+                "num_dex_instructions",
+                0
+            ) > 10000
+            else 0
+        )
+        +
+        (
+            10
+            if vector.get(
+                "has_native_libs",
+                0
+            )
+            else 0
+        )
+    )
+
+    manifest_risk = min(
+        100,
+        vector.get(
+            "is_debuggable",
+            0
+        ) * 15
+        +
+        vector.get(
+            "uses_cleartext_traffic",
+            0
+        ) * 10
+        +
+        vector.get(
+            "num_intent_filters",
+            0
+        ) * 1.5
+    )
+
+    score = min(
+        99,
+        5
+        + permission_risk * 0.40
+        + component_risk * 0.15
+        + api_risk * 0.20
+        + dex_risk * 0.15
+        + manifest_risk * 0.10
+    )
+
+    return (
+        hits,
+        permission_risk,
+        component_risk,
+        api_risk,
+        dex_risk,
+        manifest_risk,
+        score,
+    )
+
+
+# ============================================================
+# LOAD TRAINED MODEL
+# ============================================================
 
 def _load_model():
 
     if joblib is None:
         return None
 
-    p = Path("models/model.joblib")
+    model_path = Path(
+        "models/model.joblib"
+    )
 
-    if not p.exists():
+    if not model_path.exists():
         return None
 
     try:
-        return joblib.load(p)
-
+        return joblib.load(
+            model_path
+        )
     except Exception:
-        # Never crash the dashboard because of a model issue
         return None
 
 
-def _calculate_scores(evidence, op_counts):
-
-    perms = evidence.get(
-        "permissions",
-        []
-    )
-
-    hits = [
-        (p, SENSITIVE[p])
-        for p in perms
-        if p in SENSITIVE
-    ]
-
-    # -------------------------------------------
-    # Permission risk
-    # -------------------------------------------
-
-    perm_risk = min(
-        100,
-        sum(w for _, w in hits) * 4
-    )
-
-    # -------------------------------------------
-    # Android component risk
-    # -------------------------------------------
-
-    comp_counts = [
-        (
-            "Activities",
-            len(evidence.get("activities", []))
-        ),
-        (
-            "Services",
-            len(evidence.get("services", []))
-        ),
-        (
-            "Receivers",
-            len(evidence.get("receivers", []))
-        ),
-        (
-            "Providers",
-            len(evidence.get("providers", []))
-        ),
-    ]
-
-    comp_risk = min(
-        100,
-        sum(n for _, n in comp_counts) * 5
-    )
-
-    # -------------------------------------------
-    # DEX risk
-    # -------------------------------------------
-
-    dex_present = evidence.get(
-        "dex_files",
-        0
-    ) > 0
-
-    opcode_count = evidence.get(
-        "opcode_instructions",
-        0
-    )
-
-    dex_risk = min(
-        100,
-        int(bool(op_counts)) * 35
-        + int(opcode_count > 10000) * 25
-    )
-
-    # -------------------------------------------
-    # Base threat score
-    # -------------------------------------------
-
-    base_score = min(
-        99,
-        5
-        + perm_risk * 0.45
-        + comp_risk * 0.20
-        + dex_risk * 0.35
-    )
-
-    return (
-        hits,
-        comp_counts,
-        perm_risk,
-        comp_risk,
-        dex_risk,
-        base_score
-    )
-
+# ============================================================
+# FINAL APK ANALYSIS
+# ============================================================
 
 def analyze_apk(apk_path):
 
     try:
-        evidence, op_counts = extract_features(
+
+        (
+            evidence,
+            vector,
+            opcode_counts
+        ) = extract_features(
             apk_path
         )
 
     except Exception as error:
 
-        # Return structured result instead of crashing Streamlit
         return {
+
             "verdict": "UNKNOWN",
+
             "confidence": None,
+
             "threat_score": 0,
+
             "permission_risk": 0,
+
             "component_risk": 0,
+
+            "api_risk": 0,
+
             "dex_risk": 0,
+
+            "manifest_risk": 0,
+
             "indicator_count": 0,
+
             "permissions": [],
+
             "components": [],
+
             "dex_files": 0,
+
             "opcode_ngrams": 0,
-            "dex_details": [
-                {
-                    "dex_files": 0,
-                    "opcode_instructions": 0,
-                    "nonzero_opcode_2grams": 0
-                }
-            ],
+
+            "feature_count": 75,
+
+            "feature_vector": {},
+
+            "dex_details": [{
+
+                "dex_files": 0,
+
+                "opcode_instructions": 0,
+
+                "nonzero_opcode_2grams": 0,
+            }],
+
             "evidence": {
-                "sha256": hashlib.sha256(
-                    Path(apk_path).read_bytes()
-                ).hexdigest(),
-                "analysis_mode": "failed",
-                "error": str(error)
+
+                "sha256":
+                    hashlib.sha256(
+                        Path(
+                            apk_path
+                        ).read_bytes()
+                    ).hexdigest(),
+
+                "analysis_mode":
+                    "failed",
+
+                "error":
+                    str(error),
             },
-            "explanation": (
-                "The APK could not be completely analyzed. "
-                "The application did not execute the APK. "
-                f"Analysis error: {error}"
-            ),
+
+            "explanation":
+                "The APK could not be analyzed. "
+                "The APK was not executed. "
+                f"Static-analysis error: {error}",
         }
 
     (
         hits,
-        comp_counts,
-        perm_risk,
-        comp_risk,
+        permission_risk,
+        component_risk,
+        api_risk,
         dex_risk,
-        base_score
+        manifest_risk,
+        base_score,
     ) = _calculate_scores(
         evidence,
-        op_counts
+        vector
     )
 
-    # ---------------------------------------------------------
-    # ML MODEL
-    # ---------------------------------------------------------
+    # ========================================================
+    # TRAINED ML MODEL
+    # ========================================================
 
     model = _load_model()
 
     confidence = None
     ml_prediction = None
+    model_error = None
 
     if model is not None:
 
@@ -680,90 +1304,71 @@ def analyze_apk(apk_path):
                 None
             )
 
-            if feature_names is not None:
+            if feature_names is None:
 
-                perms = evidence.get(
-                    "permissions",
-                    []
+                expected = getattr(
+                    model,
+                    "n_features_in_",
+                    None
                 )
 
-                vec = {
-                    f"perm::{p}": int(
-                        p in perms
+                if expected not in (
+                    None,
+                    75
+                ):
+                    raise ValueError(
+                        f"Model expects "
+                        f"{expected} features; "
+                        f"this pipeline provides 75."
                     )
-                    for p in SENSITIVE
-                }
-
-                vec.update({
-                    f"op2::{k}": v
-                    for k, v in op_counts.items()
-                })
-
-                vec.update({
-                    "num_activities": len(
-                        evidence.get(
-                            "activities",
-                            []
-                        )
-                    ),
-                    "num_services": len(
-                        evidence.get(
-                            "services",
-                            []
-                        )
-                    ),
-                    "num_receivers": len(
-                        evidence.get(
-                            "receivers",
-                            []
-                        )
-                    ),
-                    "num_providers": len(
-                        evidence.get(
-                            "providers",
-                            []
-                        )
-                    ),
-                    "num_permissions": len(
-                        perms
-                    ),
-                })
 
                 X = np.array(
-                    [
-                        [
-                            vec.get(
-                                str(feature),
-                                0
-                            )
-                            for feature in feature_names
-                        ]
-                    ],
+                    [[
+                        vector[name]
+                        for name in FEATURE_NAMES
+                    ]],
                     dtype=float
                 )
 
-                ml_prediction = int(
-                    model.predict(X)[0]
+            else:
+
+                X = np.array(
+                    [[
+                        vector.get(
+                            str(name),
+                            0
+                        )
+                        for name in feature_names
+                    ]],
+                    dtype=float
                 )
 
-                if hasattr(
-                    model,
-                    "predict_proba"
-                ):
-                    confidence = float(
-                        np.max(
-                            model.predict_proba(X)[0]
-                        )
-                    )
+            ml_prediction = int(
+                model.predict(X)[0]
+            )
 
-        except Exception as model_error:
+            if hasattr(
+                model,
+                "predict_proba"
+            ):
+
+                confidence = float(
+                    np.max(
+                        model.predict_proba(X)[0]
+                    )
+                )
+
+        except Exception as error:
+
+            model_error = str(error)
 
             ml_prediction = None
+
             confidence = None
 
-    # ---------------------------------------------------------
+    # ========================================================
     # VERDICT
-    # ---------------------------------------------------------
+    # ========================================================
 
     if ml_prediction is not None:
 
@@ -774,8 +1379,10 @@ def analyze_apk(apk_path):
         )
 
         explanation = (
-            "Prediction generated using the trained "
-            "machine-learning model."
+            "Prediction generated using "
+            "the trained machine-learning "
+            "model with the fixed 75-feature "
+            "static representation."
         )
 
     else:
@@ -786,86 +1393,183 @@ def analyze_apk(apk_path):
             else "BENIGN"
         )
 
-        if evidence.get(
-            "analysis_mode"
-        ) == "manifest_only":
+        if model is None:
 
             explanation = (
-                "Manifest-level analysis completed. "
-                "DEX analysis was skipped because the APK "
-                "contained an invalid or unreadable DEX file. "
-                "The displayed threat score is therefore "
-                "based on available static manifest indicators "
-                "and should not be presented as a full DEX+ML "
-                "classification."
+                "75 static features were "
+                "extracted successfully. "
+                "models/model.joblib was not "
+                "found, so this is an "
+                "explainable backup heuristic "
+                "and not a trained ML prediction."
             )
 
         else:
 
             explanation = (
-                "Prototype heuristic because "
-                "models/model.joblib is not present. "
-                "Do not report this heuristic as the "
-                "paper's trained classifier."
+                "75 static features were "
+                "extracted successfully, but "
+                "the trained model could not "
+                f"be used: {model_error}. "
+                "The displayed verdict is "
+                "therefore the backup heuristic."
             )
 
-    # ---------------------------------------------------------
-    # FINAL RESULT
-    # ---------------------------------------------------------
+    component_counts = [
+
+        (
+            "Activities",
+            len(
+                evidence.get(
+                    "activities",
+                    []
+                )
+            )
+        ),
+
+        (
+            "Services",
+            len(
+                evidence.get(
+                    "services",
+                    []
+                )
+            )
+        ),
+
+        (
+            "Receivers",
+            len(
+                evidence.get(
+                    "receivers",
+                    []
+                )
+            )
+        ),
+
+        (
+            "Providers",
+            len(
+                evidence.get(
+                    "providers",
+                    []
+                )
+            )
+        ),
+    ]
 
     return {
-        "verdict": verdict,
-        "confidence": confidence,
-        "threat_score": round(
-            base_score,
-            2
-        ),
-        "permission_risk": round(
-            perm_risk,
-            2
-        ),
-        "component_risk": round(
-            comp_risk,
-            2
-        ),
-        "dex_risk": round(
-            dex_risk,
-            2
-        ),
-        "indicator_count": len(
-            hits
-        ),
+
+        "verdict":
+            verdict,
+
+        "confidence":
+            confidence,
+
+        "threat_score":
+            round(
+                base_score,
+                2
+            ),
+
+        "permission_risk":
+            round(
+                permission_risk,
+                2
+            ),
+
+        "component_risk":
+            round(
+                component_risk,
+                2
+            ),
+
+        "api_risk":
+            round(
+                api_risk,
+                2
+            ),
+
+        "dex_risk":
+            round(
+                dex_risk,
+                2
+            ),
+
+        "manifest_risk":
+            round(
+                manifest_risk,
+                2
+            ),
+
+        "indicator_count":
+            len(hits),
+
         "permissions": [
+
             (
-                p,
-                "HIGH" if w >= 9 else "MEDIUM",
-                w
+                permission,
+                (
+                    "HIGH"
+                    if weight >= 9
+                    else "MEDIUM"
+                ),
+                weight,
             )
-            for p, w in hits
+
+            for permission, weight
+            in hits
         ],
-        "components": comp_counts,
-        "dex_files": evidence.get(
-            "dex_files",
-            0
-        ),
-        "opcode_ngrams": len(
-            op_counts
-        ),
-        "dex_details": [
-            {
-                "dex_files": evidence.get(
+
+        "components":
+            component_counts,
+
+        "dex_files":
+            evidence.get(
+                "dex_files",
+                0
+            ),
+
+        "opcode_ngrams":
+            sum(
+                1
+                for value
+                in opcode_counts.values()
+                if value > 0
+            ),
+
+        "feature_count":
+            75,
+
+        "feature_vector":
+            vector,
+
+        "dex_details": [{
+
+            "dex_files":
+                evidence.get(
                     "dex_files",
                     0
                 ),
-                "opcode_instructions": evidence.get(
+
+            "opcode_instructions":
+                evidence.get(
                     "opcode_instructions",
                     0
                 ),
-                "nonzero_opcode_2grams": len(
-                    op_counts
+
+            "nonzero_opcode_2grams":
+                sum(
+                    1
+                    for value
+                    in opcode_counts.values()
+                    if value > 0
                 ),
-            }
-        ],
-        "evidence": evidence,
-        "explanation": explanation,
+        }],
+
+        "evidence":
+            evidence,
+
+        "explanation":
+            explanation,
     }
